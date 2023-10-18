@@ -1,0 +1,167 @@
+from datetime import datetime, timedelta
+from slugify import slugify
+
+from airflow import models
+from airflow.operators.python import PythonOperator
+from airflow.providers.google.cloud.operators.kubernetes_engine import (
+    GKEStartPodOperator,
+)
+
+from kubernetes.client import models as k8s_models
+
+
+### THIS SHOULD BE IN SPEARATE INCLUDE FILE, KEEPING THIS HERE FOR DEMO CONVENIENCE ###
+{% if grouping | default(True) %}
+from airflow_utils import *
+{% endif %}
+
+MACHINE_PREFIX = "{{ resources_tag_prefix | default('machine:') }}"
+GROUPING_PREFIX = "{{ grouping_tag_prefix | default('airflow:') }}"
+
+tag_machine_mapping = {
+    f"{MACHINE_PREFIX}small" : k8s_models.V1ResourceRequirements(
+                limits={"memory": "250M"},
+                requests={"cpu": "100m"},
+    ),
+    f"{MACHINE_PREFIX}medium" : k8s_models.V1ResourceRequirements(
+                limits={"memory": "4G"},
+                requests={"cpu": "2"},
+    ),
+    "__default__" : k8s_models.V1ResourceRequirements(
+                limits={"memory": "250M"},
+                requests={"cpu": "100m"},
+    ),
+}
+### END OF EXTERNAL 'IMPORTS' ###
+
+pipeline_name = "{{ pipeline_name | safe }}"
+
+node_tags = {
+{% for node in pipeline.nodes if node != "export_mlflow_run_id" %}    "{{ node.name | safe }}" : [{% for tag in node.tags %}"{{tag}}",{% endfor %}],
+{% endfor %}}
+
+node_dependencies = {
+    {% for parent_node, child_nodes in dependencies.items() if "export_mlflow_run_id" != parent_node -%}      
+{%raw%}    {%endraw%}"{{ parent_node.name | safe }}" : [
+{% for child in child_nodes %}        "{{ child.name | safe }}",
+{% endfor %}    ],{%raw%}
+{%endraw%}
+{%- endfor %}}
+
+# Set of airflow task names
+task_names = set()
+
+{% if grouping | default(True) %}
+group_translator, tag_groups = group_nodes_with_tags(node_tags, GROUPING_PREFIX)
+task_names, group_dependencies = get_tasks_from_dependencies(node_dependencies, group_translator)
+update_node_tags(node_tags, tag_groups)
+{% else %}
+for parent, children in node_dependencies.items():
+    task_names.add(parent)
+    for child in children:
+        task_names.add(child)
+{% endif %}
+
+with models.DAG(
+    "{{ dag_name | safe }}",
+    tags={{ tags | default([])}},    
+    max_active_runs={{ max_active_runs | default(3) }},
+    schedule_interval={% if schedule_interval %}"{{ schedule_interval | default('@once') }}"{% else %}None{% endif %},
+    start_date=datetime({{ start_date | default([2023, 1, 1]) | join(",")}}),
+    catchup={{ catchup | default(False) }},
+    # Default settings applied to all tasks
+    default_args=dict(
+        owner="{{ owner | default('airflow') }}",
+        depends_on_past={{ depends_on_past | default(False) }},
+        email_on_failure={{ email_on_failure | default(False) }},
+        email_on_retry={{ email_on_retry | default(False) }},
+        retries={{ retries | default(1) }},
+        retry_delay=timedelta(minutes={{ retry_delay | default(5) }})
+    )
+) as dag:
+    PROJECT_ID = "{{ gcp_project_id }}"
+    CLUSTER_REGION = "{{ gcp_region }}"
+    CLUSTER_NAME = "{{ gcp_gke_cluster_name }}"
+    {# airflow_whoami_triggerer = PythonOperator(
+    task_id='airflow_whoami_triggerer',
+    python_callable=fetch_and_log_trigger_info,
+    provide_context=True,  # Pass the context to the Python function
+    ) #}
+    mlflow_init_task = GKEStartPodOperator(
+            task_id="mlflow-run-init-node",
+            name="pod-airflow-xcom-export-mlflow-run-id",
+            project_id=PROJECT_ID,
+            location=CLUSTER_REGION,
+            cluster_name=CLUSTER_NAME,
+            cmds=["python", "-m", "kedro", "run", "--pipeline", "airflow_xcom", "--env", "{{ env | default(local) }}"],
+            namespace="{{ k8s_namespace | default(default) }}",
+            image="{{ docker_image }}",
+            labels={"application": f"kedro-pipeline-{slugify(pipeline_name)}"},
+            startup_timeout_seconds=120,
+            service_account_name="{{ k8s_service_account | default(default) }}",
+            get_logs=True,
+            image_pull_policy="Always",
+            env_vars={"MLFLOW_RUN_NAME": pipeline_name},
+            annotations={},
+            container_resources=tag_machine_mapping[f"{MACHINE_PREFIX}small"],
+            do_xcom_push=True,
+    )
+    tasks = {
+            # All parameters below are able to be templated with jinja -- cmds,
+            # arguments, env_vars, and config_file. For more information visit:
+            # https://airflow.apache.org/docs/apache-airflow/stable/macros-ref.html
+    name : GKEStartPodOperator(
+        {% if grouping | default(True) %}
+            task_id=name.lstrip(GROUPING_PREFIX),
+            cmds=["python", "-m", "kedro", "run", "--pipeline", pipeline_name, "--tags", name, "--env", "{{ env | default(local) }}"] if name.startswith(GROUPING_PREFIX)
+            else ["python", "-m", "kedro", "run", "--pipeline", pipeline_name, "--nodes", name, "--env", "{{ env | default(local) }}"],
+            name=f"pod-{ slugify(pipeline_name) }-{ slugify(name.lstrip(GROUPING_PREFIX)) }",
+        {% else %}
+            task_id=name,
+            cmds=["python", "-m", "kedro", "run", "--pipeline", pipeline_name, "--nodes", name, "--env", "{{ env | default(local) }}"],
+            name=f"pod-{ slugify(pipeline_name) }-{ slugify(name) }",
+        {% endif %}
+            project_id=PROJECT_ID,
+            location=CLUSTER_REGION,
+            cluster_name=CLUSTER_NAME,
+            namespace="{{ k8s_namespace | default(default) }}",
+            image="{{ docker_image }}",
+            annotations={
+                f"tag-{slugify(tag)}" : "true" for tag in node_tags[name]
+            },
+            labels={"application": f"kedro-pipeline-{ slugify(pipeline_name) }"},
+            startup_timeout_seconds=120,
+            service_account_name="{{ k8s_service_account | default(default) }}",
+            get_logs=True,
+            image_pull_policy="Always",
+            env_vars={"MLFLOW_RUN_ID": "{% raw %}{{ task_instance.xcom_pull(task_ids='mlflow-run-init-node') }}{% endraw %}"},
+            container_resources=tag_machine_mapping[next(filter(lambda tag: tag in tag_machine_mapping, list(node_tags[name]) + ["__default__"]))],
+            do_xcom_push=False,
+    ) for name in task_names 
+    }
+
+{% if grouping | default(True) %}
+    for task, children in group_dependencies.items():
+{% else %}
+    for task, children in node_dependencies.items():
+{% endif %}
+        for child in children:
+            tasks[task] >> tasks[child]
+    
+    # Determining the nodes that do not have other nodes pointing to them and appending mlflow run init task before them
+    nodes_indegree = dict()
+{% if grouping | default(True) %}
+    for node, edges in group_dependencies.items():
+{% else %}
+    for node, edges in node_dependencies.items():
+{% endif %}
+        if node not in nodes_indegree:
+            nodes_indegree[node] = 0
+        for edge in edges:
+            nodes_indegree[edge] = nodes_indegree.get(edge, 0) + 1
+        
+    for node, degree in nodes_indegree.items():
+        if degree == 0:
+            mlflow_init_task >> tasks[node]
+
+    {# airflow_whoami_triggerer >> mlflow_init_task #}

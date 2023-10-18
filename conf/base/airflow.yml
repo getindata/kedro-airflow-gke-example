@@ -1,0 +1,32 @@
+# Global parameters
+default:
+    # FIXME: this prefix is not single point of configuration yet - it is also in pipeline registry which can't read from here
+    # Can't be properly fixed until there is suitable hook before pipeline is created in pipeline registry
+    grouping_prefix: "airflow:"
+    resources_tag_prefix: "machine:"
+    # When grouping is enabled, nodes tagged with grouping prefix get grouped together at the same node of Airflow DAG for shared execution
+    # Make sure the grouping_prefix is not a prefix for any node names and that every node has only one of tags with such prefix and that they are not disjoint
+    grouping: true
+    gcp_project_id: "gid-labs-mlops-sandbox"
+    gcp_region: "europe-west1"
+    gcp_gke_cluster_name: "europe-west1-test-environme-f2fad41f-gke"
+    k8s_namespace: "airflow-ml-jobs"
+    k8s_service_account: "composer-airflow"
+    docker_image: "europe-west1-docker.pkg.dev/gid-labs-mlops-sandbox/images/spaceflights-airflow"
+    start_date: [2023, 1, 1]
+    max_active_runs: 2
+    # https://airflow.apache.org/docs/stable/scheduler.html#dag-runs
+    schedule_interval: "@once" # null
+    catchup: false
+    # Default settings applied to all tasks
+    owner: "airflow"
+    depends_on_past: false
+    email_on_failure: false
+    email_on_retry: false
+    retries: 0
+    retry_delay: 5
+
+
+# Arguments specific to the pipeline (overrides the parameters above)
+data_science:
+    owner: "airflow-ds"
